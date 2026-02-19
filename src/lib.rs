@@ -262,7 +262,11 @@ pub fn run() -> Result<()> {
     if high_confidence_graph || cli.include_low_confidence {
         unused_files = files
             .difference(&reachable)
-            .filter(|path| !is_test_like_file(path) && !is_declaration_file(path))
+            .filter(|path| {
+                !is_test_like_file(path)
+                    && !is_declaration_file(path)
+                    && !is_common_config_file(path)
+            })
             .map(|path| relative_display(&root, path))
             .collect();
         unused_files.sort();
@@ -1071,6 +1075,80 @@ fn is_test_like_file(path: &Path) -> bool {
         || file_name.contains(".spec.")
         || path_str.contains("/__tests__/")
         || path_str.contains("\\__tests__\\")
+}
+
+fn is_common_config_file(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let lower = file_name.to_ascii_lowercase();
+
+    if lower.contains("config") {
+        return true;
+    }
+
+    if file_name.starts_with(".eslintrc")
+        || file_name.starts_with(".prettierrc")
+        || file_name.starts_with(".stylelintrc")
+        || file_name.starts_with(".babelrc")
+    {
+        return true;
+    }
+
+    // Generic tooling config pattern, e.g. i18next-parser.config.js
+    let config_exts = [".js", ".cjs", ".mjs", ".ts", ".cts", ".mts", ".json"];
+    if file_name.contains(".config.") && config_exts.iter().any(|ext| file_name.ends_with(ext)) {
+        return true;
+    }
+
+    let known = [
+        "eslint.config.js",
+        "eslint.config.cjs",
+        "eslint.config.mjs",
+        "eslint.config.ts",
+        "eslint.config.mts",
+        "eslint.config.cts",
+        "vite.config.js",
+        "vite.config.cjs",
+        "vite.config.mjs",
+        "vite.config.ts",
+        "vite.config.mts",
+        "vite.config.cts",
+        "vitest.config.js",
+        "vitest.config.cjs",
+        "vitest.config.mjs",
+        "vitest.config.ts",
+        "vitest.config.mts",
+        "vitest.config.cts",
+        "jest.config.js",
+        "jest.config.cjs",
+        "jest.config.mjs",
+        "jest.config.ts",
+        "jest.config.mts",
+        "jest.config.cts",
+        "webpack.config.js",
+        "webpack.config.cjs",
+        "webpack.config.mjs",
+        "webpack.config.ts",
+        "rollup.config.js",
+        "rollup.config.cjs",
+        "rollup.config.mjs",
+        "rollup.config.ts",
+        "postcss.config.js",
+        "postcss.config.cjs",
+        "tailwind.config.js",
+        "tailwind.config.cjs",
+        "tailwind.config.ts",
+        "babel.config.js",
+        "babel.config.cjs",
+        "commitlint.config.js",
+        "commitlint.config.cjs",
+        "lint-staged.config.js",
+        "lint-staged.config.cjs",
+    ];
+
+    known.contains(&file_name)
 }
 
 fn is_ignored_dir(path: &Path) -> bool {
