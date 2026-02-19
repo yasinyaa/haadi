@@ -36,11 +36,13 @@ pub(crate) fn collect_asset_files(root: &Path) -> Result<HashSet<PathBuf>> {
 
 pub(crate) fn collect_used_assets(
     root: &Path,
-    reachable: &HashSet<PathBuf>,
+    source_files: &HashSet<PathBuf>,
     assets: &HashSet<PathBuf>,
 ) -> Result<HashSet<PathBuf>> {
     let mut used = HashSet::new();
-    let string_literals = collect_string_literals(reachable)?;
+    let string_literals = collect_string_literals(source_files)?;
+    let resolved_asset_usages = resolve_assets_from_source_imports(root, source_files, assets)?;
+    used.extend(resolved_asset_usages);
 
     for asset in assets {
         if is_public_asset(asset) {
@@ -61,6 +63,101 @@ pub(crate) fn collect_used_assets(
     Ok(used)
 }
 
+fn resolve_assets_from_source_imports(
+    root: &Path,
+    source_files: &HashSet<PathBuf>,
+    assets: &HashSet<PathBuf>,
+) -> Result<HashSet<PathBuf>> {
+    let mut used = HashSet::new();
+
+    for source_file in source_files {
+        let source = fs::read_to_string(source_file).unwrap_or_default();
+        for caps in STRING_LITERAL_RE.captures_iter(&source) {
+            for idx in [1usize, 2, 3] {
+                let Some(m) = caps.get(idx) else {
+                    continue;
+                };
+                let raw = m.as_str();
+                if raw.is_empty() {
+                    continue;
+                }
+                let spec = normalize_specifier(raw);
+                if spec.is_empty() {
+                    continue;
+                }
+
+                if let Some(resolved) = resolve_asset_specifier(root, source_file, &spec, assets)? {
+                    used.insert(resolved);
+                }
+            }
+        }
+    }
+
+    Ok(used)
+}
+
+fn resolve_asset_specifier(
+    root: &Path,
+    from_file: &Path,
+    specifier: &str,
+    assets: &HashSet<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    if is_relative_specifier(specifier) {
+        let Some(parent) = from_file.parent() else {
+            return Ok(None);
+        };
+        return resolve_asset_candidate(&parent.join(specifier), assets);
+    }
+
+    if let Some(trimmed) = specifier.strip_prefix('/') {
+        return resolve_asset_candidate(&root.join(trimmed), assets);
+    }
+
+    if let Some(trimmed) = specifier.strip_prefix("@/") {
+        return resolve_asset_candidate(&root.join("src").join(trimmed), assets);
+    }
+
+    if let Some(trimmed) = specifier.strip_prefix("~/") {
+        return resolve_asset_candidate(&root.join("src").join(trimmed), assets);
+    }
+
+    if specifier.starts_with("src/") {
+        return resolve_asset_candidate(&root.join(specifier), assets);
+    }
+
+    Ok(None)
+}
+
+fn resolve_asset_candidate(
+    raw_candidate: &Path,
+    assets: &HashSet<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let mut candidates = Vec::new();
+
+    if raw_candidate.extension().is_some() {
+        candidates.push(raw_candidate.to_path_buf());
+    } else {
+        candidates.push(raw_candidate.to_path_buf());
+        for ext in ASSET_EXTENSIONS {
+            candidates.push(raw_candidate.with_extension(ext));
+        }
+        for ext in ASSET_EXTENSIONS {
+            candidates.push(raw_candidate.join(format!("index.{ext}")));
+        }
+    }
+
+    for candidate in candidates {
+        if candidate.exists() {
+            let canonical = fs::canonicalize(&candidate)?;
+            if assets.contains(&canonical) {
+                return Ok(Some(canonical));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn collect_string_literals(files: &HashSet<PathBuf>) -> Result<HashSet<String>> {
     let mut out = HashSet::new();
 
@@ -71,12 +168,30 @@ fn collect_string_literals(files: &HashSet<PathBuf>) -> Result<HashSet<String>> 
                 let s = single.as_str();
                 if !s.is_empty() {
                     out.insert(s.to_string());
+                    let normalized = normalize_specifier(s);
+                    if !normalized.is_empty() {
+                        out.insert(normalized);
+                    }
                 }
             }
             if let Some(double) = caps.get(2) {
                 let s = double.as_str();
                 if !s.is_empty() {
                     out.insert(s.to_string());
+                    let normalized = normalize_specifier(s);
+                    if !normalized.is_empty() {
+                        out.insert(normalized);
+                    }
+                }
+            }
+            if let Some(template) = caps.get(3) {
+                let s = template.as_str();
+                if !s.is_empty() {
+                    out.insert(s.to_string());
+                    let normalized = normalize_specifier(s);
+                    if !normalized.is_empty() {
+                        out.insert(normalized);
+                    }
                 }
             }
         }
@@ -95,6 +210,8 @@ fn asset_reference_candidates(root: &Path, asset: &Path) -> Vec<String> {
     if let Some(stripped) = rel_norm.strip_prefix("src/") {
         refs.insert(stripped.to_string());
         refs.insert(format!("/{stripped}"));
+        refs.insert(format!("@/{stripped}"));
+        refs.insert(format!("~/{stripped}"));
     }
 
     if let Some(stripped) = rel_norm.strip_prefix("public/") {
@@ -104,6 +221,14 @@ fn asset_reference_candidates(root: &Path, asset: &Path) -> Vec<String> {
 
     if let Some(file_name) = asset.file_name().and_then(|s| s.to_str()) {
         refs.insert(file_name.to_string());
+    }
+
+    let base_refs: Vec<String> = refs.iter().cloned().collect();
+    let query_suffixes = ["?react", "?url", "?raw", "?inline", "?component"];
+    for base in base_refs {
+        for suffix in query_suffixes {
+            refs.insert(format!("{base}{suffix}"));
+        }
     }
 
     refs.into_iter().collect()

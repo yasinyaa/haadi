@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiPage {
@@ -23,6 +24,31 @@ struct DeleteCandidate {
     kind: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteFilter {
+    All,
+    Files,
+    Assets,
+}
+
+impl DeleteFilter {
+    fn next(self) -> Self {
+        match self {
+            DeleteFilter::All => DeleteFilter::Files,
+            DeleteFilter::Files => DeleteFilter::Assets,
+            DeleteFilter::Assets => DeleteFilter::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DeleteFilter::All => "all",
+            DeleteFilter::Files => "files",
+            DeleteFilter::Assets => "assets",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DeleteState {
     items: Vec<DeleteCandidate>,
@@ -30,6 +56,12 @@ struct DeleteState {
     cursor: usize,
     confirm_delete: bool,
     confirm_empty_trash: bool,
+    confirm_restore_previous: bool,
+    confirm_restore_all: bool,
+    filter: DeleteFilter,
+    search_query: String,
+    search_input: String,
+    editing_search: bool,
     message: String,
     root: PathBuf,
     trash_root: PathBuf,
@@ -96,7 +128,12 @@ pub(crate) fn print_human_report(report: &Report) {
         report.summary.omitted_risky_findings
     );
     println!("  - Unused files: {}", report.summary.unused_files_count);
+    println!("  - Used assets: {}", report.summary.used_assets_count);
     println!("  - Unused assets: {}", report.summary.unused_assets_count);
+    println!(
+        "  - Asset usage coverage: {:.1}%",
+        report.summary.asset_usage_coverage_pct
+    );
     println!(
         "  - Unused dependencies: {}",
         report.summary.unused_dependencies_count
@@ -124,6 +161,11 @@ pub(crate) fn print_human_report(report: &Report) {
 
     println!("\nUnused files ({}):", report.unused_files.len());
     for path in &report.unused_files {
+        println!("  - {path}");
+    }
+
+    println!("\nUsed assets ({}):", report.used_assets.len());
+    for path in &report.used_assets {
         println!("  - {path}");
     }
 
@@ -173,6 +215,12 @@ pub(crate) fn print_tui_report(report: &Report) -> Result<()> {
             cursor: 0,
             confirm_delete: false,
             confirm_empty_trash: false,
+            confirm_restore_previous: false,
+            confirm_restore_all: false,
+            filter: DeleteFilter::All,
+            search_query: String::new(),
+            search_input: String::new(),
+            editing_search: false,
             message: "Select unused files/assets, then press x and confirm with y.".to_string(),
             root: PathBuf::from(&report.root),
             trash_root: PathBuf::from(&report.root).join(".haadi_trash"),
@@ -235,6 +283,37 @@ fn handle_summary_key(code: KeyCode, state: &mut TuiState) -> bool {
 }
 
 fn handle_delete_key(code: KeyCode, state: &mut TuiState) -> Result<bool> {
+    if state.delete.editing_search {
+        match code {
+            KeyCode::Enter => {
+                state.delete.search_query = state.delete.search_input.clone();
+                state.delete.editing_search = false;
+                state.delete.message = format!(
+                    "Search applied: '{}'.",
+                    if state.delete.search_query.is_empty() {
+                        "(none)"
+                    } else {
+                        state.delete.search_query.as_str()
+                    }
+                );
+                clamp_delete_cursor(&mut state.delete);
+            }
+            KeyCode::Esc => {
+                state.delete.editing_search = false;
+                state.delete.search_input.clear();
+                state.delete.message = "Search edit canceled.".to_string();
+            }
+            KeyCode::Backspace => {
+                state.delete.search_input.pop();
+            }
+            KeyCode::Char(c) => {
+                state.delete.search_input.push(c);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
     if state.delete.confirm_delete {
         match code {
             KeyCode::Char('y') => {
@@ -265,6 +344,36 @@ fn handle_delete_key(code: KeyCode, state: &mut TuiState) -> Result<bool> {
         return Ok(false);
     }
 
+    if state.delete.confirm_restore_previous {
+        match code {
+            KeyCode::Char('y') => {
+                restore_previous_session(&mut state.delete)?;
+                state.delete.confirm_restore_previous = false;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                state.delete.confirm_restore_previous = false;
+                state.delete.message = "Restore previous session canceled.".to_string();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    if state.delete.confirm_restore_all {
+        match code {
+            KeyCode::Char('y') => {
+                restore_all_sessions(&mut state.delete)?;
+                state.delete.confirm_restore_all = false;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                state.delete.confirm_restore_all = false;
+                state.delete.message = "Restore all sessions canceled.".to_string();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
     match code {
         KeyCode::Char('q') => Ok(true),
         KeyCode::Char('b') | KeyCode::Esc => {
@@ -272,13 +381,15 @@ fn handle_delete_key(code: KeyCode, state: &mut TuiState) -> Result<bool> {
             Ok(false)
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if state.delete.cursor > 0 {
-                state.delete.cursor -= 1;
+            let filtered = filtered_indices(&state.delete);
+            if !filtered.is_empty() && state.delete.cursor > 0 {
+                state.delete.cursor = state.delete.cursor.saturating_sub(1);
             }
             Ok(false)
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if state.delete.cursor + 1 < state.delete.items.len() {
+            let filtered = filtered_indices(&state.delete);
+            if state.delete.cursor + 1 < filtered.len() {
                 state.delete.cursor += 1;
             }
             Ok(false)
@@ -288,7 +399,8 @@ fn handle_delete_key(code: KeyCode, state: &mut TuiState) -> Result<bool> {
             Ok(false)
         }
         KeyCode::Char('a') => {
-            state.delete.selected = (0..state.delete.items.len()).collect();
+            let filtered = filtered_indices(&state.delete);
+            state.delete.selected = filtered.into_iter().collect();
             state.delete.message = format!("Selected {} items.", state.delete.selected.len());
             Ok(false)
         }
@@ -315,8 +427,33 @@ fn handle_delete_key(code: KeyCode, state: &mut TuiState) -> Result<bool> {
                 "Empty trash and clear undo history? Press y to confirm, n to cancel.".to_string();
             Ok(false)
         }
+        KeyCode::Char('r') => {
+            state.delete.confirm_restore_previous = true;
+            state.delete.message =
+                "Restore most recent previous trash session? Press y to confirm, n to cancel."
+                    .to_string();
+            Ok(false)
+        }
+        KeyCode::Char('R') => {
+            state.delete.confirm_restore_all = true;
+            state.delete.message =
+                "Restore ALL trash sessions? Press y to confirm, n to cancel.".to_string();
+            Ok(false)
+        }
         KeyCode::Char('u') => {
             undo_last_deletion(&mut state.delete)?;
+            Ok(false)
+        }
+        KeyCode::Char('f') => {
+            state.delete.filter = state.delete.filter.next();
+            clamp_delete_cursor(&mut state.delete);
+            state.delete.message = format!("Filter: {}", state.delete.filter.label());
+            Ok(false)
+        }
+        KeyCode::Char('/') => {
+            state.delete.editing_search = true;
+            state.delete.search_input = state.delete.search_query.clone();
+            state.delete.message = "Search mode: type and press Enter to apply.".to_string();
             Ok(false)
         }
         _ => Ok(false),
@@ -324,14 +461,16 @@ fn handle_delete_key(code: KeyCode, state: &mut TuiState) -> Result<bool> {
 }
 
 fn toggle_selected(state: &mut DeleteState) {
-    if state.items.is_empty() {
+    let filtered = filtered_indices(state);
+    if filtered.is_empty() {
         return;
     }
+    let idx = filtered[state.cursor];
 
-    if state.selected.contains(&state.cursor) {
-        state.selected.remove(&state.cursor);
+    if state.selected.contains(&idx) {
+        state.selected.remove(&idx);
     } else {
-        state.selected.insert(state.cursor);
+        state.selected.insert(idx);
     }
 
     state.message = format!("Selected {} items.", state.selected.len());
@@ -383,12 +522,7 @@ fn apply_selected_deletions(state: &mut DeleteState) -> Result<()> {
     }
 
     state.selected.clear();
-    if state.cursor >= state.items.len() && !state.items.is_empty() {
-        state.cursor = state.items.len() - 1;
-    }
-    if state.items.is_empty() {
-        state.cursor = 0;
-    }
+    clamp_delete_cursor(state);
 
     let deleted = deleted_indices.len();
     if !deleted_entries.is_empty() {
@@ -439,12 +573,7 @@ fn undo_last_deletion(state: &mut DeleteState) -> Result<()> {
         .items
         .sort_by(|a, b| a.rel_path.cmp(&b.rel_path).then_with(|| a.kind.cmp(b.kind)));
     state.selected.clear();
-    if state.cursor >= state.items.len() && !state.items.is_empty() {
-        state.cursor = state.items.len() - 1;
-    }
-    if state.items.is_empty() {
-        state.cursor = 0;
-    }
+    clamp_delete_cursor(state);
 
     state.message = format!("Restored {restored} files. Failed: {failed}.");
 
@@ -550,6 +679,169 @@ fn empty_trash(state: &mut DeleteState) -> Result<()> {
     Ok(())
 }
 
+fn restore_previous_session(state: &mut DeleteState) -> Result<()> {
+    let sessions_root = state.trash_root.join("sessions");
+    if !sessions_root.exists() {
+        state.message = "No previous trash sessions found.".to_string();
+        return Ok(());
+    }
+
+    let mut sessions: Vec<(String, PathBuf)> = fs::read_dir(&sessions_root)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?.to_string();
+            Some((name, path))
+        })
+        .collect();
+
+    if sessions.is_empty() {
+        state.message = "No previous trash sessions found.".to_string();
+        return Ok(());
+    }
+
+    sessions.sort_by(|a, b| a.0.cmp(&b.0));
+    let (session_id, session_path) = sessions.pop().unwrap_or_default();
+    restore_session_path(state, &session_id, &session_path)
+}
+
+fn restore_all_sessions(state: &mut DeleteState) -> Result<()> {
+    let sessions_root = state.trash_root.join("sessions");
+    if !sessions_root.exists() {
+        state.message = "No trash sessions found.".to_string();
+        return Ok(());
+    }
+
+    let mut sessions: Vec<(String, PathBuf)> = fs::read_dir(&sessions_root)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?.to_string();
+            Some((name, path))
+        })
+        .collect();
+
+    if sessions.is_empty() {
+        state.message = "No trash sessions found.".to_string();
+        return Ok(());
+    }
+
+    sessions.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut total_restored = 0usize;
+    let mut total_failed = 0usize;
+    let mut restored_session_count = 0usize;
+
+    for (_session_id, session_path) in sessions {
+        let (restored, failed) =
+            restore_session_path_counts(state, &session_path, "restore_all_sessions")?;
+        if restored > 0 || failed > 0 {
+            restored_session_count += 1;
+        }
+        total_restored += restored;
+        total_failed += failed;
+    }
+
+    state.message = format!(
+        "Restored {} files from {} session(s). Failed: {}.",
+        total_restored, restored_session_count, total_failed
+    );
+
+    Ok(())
+}
+
+fn restore_session_path(
+    state: &mut DeleteState,
+    session_id: &str,
+    session_path: &Path,
+) -> Result<()> {
+    let (restored, failed) =
+        restore_session_path_counts(state, session_path, "restore_previous_session")?;
+    state.message = format!(
+        "Restored {} files from session {}. Failed: {}.",
+        restored, session_id, failed
+    );
+    Ok(())
+}
+
+fn restore_session_path_counts(
+    state: &mut DeleteState,
+    session_path: &Path,
+    log_action: &'static str,
+) -> Result<(usize, usize)> {
+    let root = fs::canonicalize(&state.root).unwrap_or_else(|_| state.root.clone());
+    let mut restored = 0usize;
+    let mut failed = 0usize;
+    let mut restored_entries = Vec::new();
+
+    for entry in WalkDir::new(&session_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let trash_file = entry.path();
+        if !trash_file.is_file() {
+            continue;
+        }
+
+        let Ok(rel) = trash_file.strip_prefix(&session_path) else {
+            failed += 1;
+            continue;
+        };
+
+        let target = root.join(rel);
+        if !target.starts_with(&root) {
+            failed += 1;
+            continue;
+        }
+        if target.exists() {
+            failed += 1;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        match fs::rename(trash_file, &target) {
+            Ok(_) => {
+                restored += 1;
+                let rel_display = rel.to_string_lossy().replace('\\', "/");
+                let kind = if has_asset_extension(&target) {
+                    "asset"
+                } else {
+                    "file"
+                };
+                let candidate = DeleteCandidate {
+                    rel_path: rel_display,
+                    kind,
+                };
+                state.items.push(candidate.clone());
+                restored_entries.push(DeletedEntry {
+                    candidate,
+                    original_abs: target.clone(),
+                    trash_abs: trash_file.to_path_buf(),
+                });
+            }
+            Err(_) => failed += 1,
+        }
+    }
+
+    state
+        .items
+        .sort_by(|a, b| a.rel_path.cmp(&b.rel_path).then_with(|| a.kind.cmp(b.kind)));
+    state.selected.clear();
+    clamp_delete_cursor(state);
+
+    let _ = fs::remove_dir_all(&session_path);
+    let batch_id = generate_batch_id();
+    if !restored_entries.is_empty() {
+        let _ = write_delete_log(&state.trash_root, log_action, &batch_id, &restored_entries);
+    }
+
+    Ok((restored, failed))
+}
+
 fn generate_batch_id() -> String {
     format!("batch-{}", now_unix_ms())
 }
@@ -595,9 +887,14 @@ fn draw_summary_page(frame: &mut Frame, report: &Report) {
             report.summary.total_entries
         )),
         Line::from(format!(
-            "unused files {} | unused assets {} | unused deps {} | unused exports {}",
+            "unused files {} | used assets {} | unused assets {}",
             report.summary.unused_files_count,
+            report.summary.used_assets_count,
             report.summary.unused_assets_count,
+        )),
+        Line::from(format!(
+            "coverage {:.1}% | unused deps {} | unused exports {}",
+            report.summary.asset_usage_coverage_pct,
             report.summary.unused_dependencies_count,
             report.summary.unused_exports_count
         )),
@@ -614,7 +911,11 @@ fn draw_summary_page(frame: &mut Frame, report: &Report) {
 
     let middle = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
         .split(root_chunks[2]);
 
     let warnings_items: Vec<ListItem> = if report.warnings.is_empty() {
@@ -649,6 +950,15 @@ fn draw_summary_page(frame: &mut Frame, report: &Report) {
                 .title("Entries (top)"),
         ),
         middle[1],
+    );
+
+    frame.render_widget(
+        List::new(top_items(&report.used_assets, 8)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Used assets (top)"),
+        ),
+        middle[2],
     );
 
     let bottom = Layout::default()
@@ -703,19 +1013,31 @@ fn draw_delete_page(frame: &mut Frame, _report: &Report, state: &TuiState) {
 
     let header = Paragraph::new(vec![
         Line::from("Delete page: select unused files/assets only"),
-        Line::from("Controls: j/k move | space toggle | a all | c clear | x delete | y approve | u undo | z empty trash | b back | q quit"),
+        Line::from("Controls: j/k move | space toggle | a all | c clear | f filter | / search | x delete | u undo | r restore prev | R restore all | z empty trash | y approve | b back | q quit"),
     ])
     .block(Block::default().borders(Borders::ALL).title("Delete mode"))
     .wrap(Wrap { trim: true });
     frame.render_widget(header, chunks[0]);
 
+    let filtered = filtered_indices(&state.delete);
     let mut rows = Vec::new();
-    if state.delete.items.is_empty() {
+    if filtered.is_empty() {
         rows.push(ListItem::new("No delete candidates."));
     } else {
-        for (idx, item) in state.delete.items.iter().enumerate() {
-            let marker = if idx == state.delete.cursor { ">" } else { " " };
-            let selected = if state.delete.selected.contains(&idx) {
+        let list_height = chunks[1].height.saturating_sub(2) as usize;
+        let window = list_height.max(1);
+        let start = state.delete.cursor.saturating_sub(window.saturating_sub(1));
+        let end = (start + window).min(filtered.len());
+
+        for (visual_idx, item_idx) in filtered[start..end].iter().enumerate() {
+            let item = &state.delete.items[*item_idx];
+            let cursor_idx = start + visual_idx;
+            let marker = if cursor_idx == state.delete.cursor {
+                ">"
+            } else {
+                " "
+            };
+            let selected = if state.delete.selected.contains(item_idx) {
                 "[x]"
             } else {
                 "[ ]"
@@ -728,11 +1050,16 @@ fn draw_delete_page(frame: &mut Frame, _report: &Report, state: &TuiState) {
     }
 
     frame.render_widget(
-        List::new(rows).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Candidates ({})", state.delete.items.len())),
-        ),
+        List::new(rows).block(Block::default().borders(Borders::ALL).title(format!(
+            "Candidates {} | filter={} | search='{}'",
+            filtered.len(),
+            state.delete.filter.label(),
+            if state.delete.search_query.is_empty() {
+                "(none)"
+            } else {
+                state.delete.search_query.as_str()
+            }
+        ))),
         chunks[1],
     );
 
@@ -745,6 +1072,19 @@ fn draw_delete_page(frame: &mut Frame, _report: &Report, state: &TuiState) {
         footer_lines.push(Line::from(
             "Approve empty trash: press y to confirm, n/Esc to cancel.",
         ));
+    } else if state.delete.confirm_restore_previous {
+        footer_lines.push(Line::from(
+            "Approve restore previous session: press y to confirm, n/Esc to cancel.",
+        ));
+    } else if state.delete.confirm_restore_all {
+        footer_lines.push(Line::from(
+            "Approve restore ALL sessions: press y to confirm, n/Esc to cancel.",
+        ));
+    } else if state.delete.editing_search {
+        footer_lines.push(Line::from(format!(
+            "Search input: {}",
+            state.delete.search_input
+        )));
     } else {
         footer_lines.push(Line::from(format!(
             "Selected: {}",
@@ -789,4 +1129,39 @@ fn build_delete_candidates(report: &Report) -> Vec<DeleteCandidate> {
 
     items.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     items
+}
+
+fn filtered_indices(state: &DeleteState) -> Vec<usize> {
+    let query = state.search_query.to_ascii_lowercase();
+    state
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            let kind_ok = match state.filter {
+                DeleteFilter::All => true,
+                DeleteFilter::Files => item.kind == "file",
+                DeleteFilter::Assets => item.kind == "asset",
+            };
+            if !kind_ok {
+                return false;
+            }
+            if query.is_empty() {
+                return true;
+            }
+            item.rel_path.to_ascii_lowercase().contains(&query)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn clamp_delete_cursor(state: &mut DeleteState) {
+    let len = filtered_indices(state).len();
+    if len == 0 {
+        state.cursor = 0;
+        return;
+    }
+    if state.cursor >= len {
+        state.cursor = len - 1;
+    }
 }

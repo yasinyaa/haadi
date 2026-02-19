@@ -72,7 +72,10 @@ static TRAILING_COMMA_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#",\s*([}\]])"#
 static IDENT_TOKEN_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"[A-Za-z_$][A-Za-z0-9_$]*"#).unwrap());
 static STRING_LITERAL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?s)(?:'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)")"#).unwrap()
+    Regex::new(
+        r#"(?s)(?:'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)"|`([^`\\]*(?:\\.[^`\\]*)*)`)"#,
+    )
+    .unwrap()
 });
 
 #[derive(Parser, Debug)]
@@ -94,6 +97,10 @@ struct Cli {
     /// Emit low-confidence findings too (may increase false positives)
     #[arg(long)]
     include_low_confidence: bool,
+
+    /// Limit asset analysis to these roots (repeatable or comma-separated), e.g. --asset-roots src/assets,public
+    #[arg(long = "asset-roots", value_delimiter = ',')]
+    asset_roots: Vec<String>,
 
     /// Emit JSON output
     #[arg(long)]
@@ -150,6 +157,7 @@ struct Report {
     entries: Vec<String>,
     warnings: Vec<String>,
     unused_files: Vec<String>,
+    used_assets: Vec<String>,
     unused_assets: Vec<String>,
     unused_dependencies: Vec<String>,
     unused_exports: Vec<UnusedExport>,
@@ -165,7 +173,9 @@ struct ReportSummary {
     high_confidence_graph: bool,
     omitted_risky_findings: bool,
     unused_files_count: usize,
+    used_assets_count: usize,
     unused_assets_count: usize,
+    asset_usage_coverage_pct: f64,
     unused_dependencies_count: usize,
     unused_exports_count: usize,
 }
@@ -197,11 +207,17 @@ pub fn run() -> Result<()> {
         .with_context(|| format!("Failed to access root: {}", cli.root.display()))?;
 
     let files = collect_source_files(&root)?;
-    let assets = collect_asset_files(&root)?;
+    let all_assets = collect_asset_files(&root)?;
+    let assets = filter_assets_by_roots(&root, &all_assets, &cli.asset_roots);
     let resolver = build_resolver(&root, &files)?;
 
     let mut warnings =
         vec!["Analysis is conservative by default to minimize false positives.".to_string()];
+    if !cli.asset_roots.is_empty() && assets.is_empty() {
+        warnings.push(
+            "No assets matched --asset-roots filter; asset findings may be empty.".to_string(),
+        );
+    }
 
     let mut modules: HashMap<PathBuf, ModuleInfo> = HashMap::new();
     for file in &files {
@@ -256,6 +272,7 @@ pub fn run() -> Result<()> {
     unused_dependencies.sort();
 
     let mut unused_files = Vec::new();
+    let mut used_assets = Vec::new();
     let mut unused_assets = Vec::new();
     let mut unused_exports = Vec::new();
 
@@ -270,9 +287,14 @@ pub fn run() -> Result<()> {
             .map(|path| relative_display(&root, path))
             .collect();
         unused_files.sort();
-        let used_assets = collect_used_assets(&root, &reachable, &assets)?;
+        let used_asset_paths = collect_used_assets(&root, &files, &assets)?;
+        used_assets = used_asset_paths
+            .iter()
+            .map(|path| relative_display(&root, path))
+            .collect();
+        used_assets.sort();
         unused_assets = assets
-            .difference(&used_assets)
+            .difference(&used_asset_paths)
             .filter(|path| !is_public_asset(path))
             .map(|path| relative_display(&root, path))
             .collect();
@@ -403,17 +425,26 @@ pub fn run() -> Result<()> {
                 .to_string(),
         );
     }
+    let total_asset_files = assets.len();
+    let unused_assets_count = unused_assets.len();
+    let used_assets_count = total_asset_files.saturating_sub(unused_assets_count);
 
     let summary = ReportSummary {
         total_source_files: files.len(),
-        total_asset_files: assets.len(),
+        total_asset_files,
         total_reachable_files: reachable.len(),
         total_entries: entries.len(),
         unresolved_local_imports: unresolved.len(),
         high_confidence_graph,
         omitted_risky_findings: !(high_confidence_graph || cli.include_low_confidence),
         unused_files_count: unused_files.len(),
-        unused_assets_count: unused_assets.len(),
+        used_assets_count,
+        unused_assets_count,
+        asset_usage_coverage_pct: if total_asset_files == 0 {
+            0.0
+        } else {
+            (used_assets_count as f64 * 100.0) / total_asset_files as f64
+        },
         unused_dependencies_count: unused_dependencies.len(),
         unused_exports_count: unused_exports.len(),
     };
@@ -427,6 +458,7 @@ pub fn run() -> Result<()> {
             .collect(),
         warnings,
         unused_files,
+        used_assets,
         unused_assets,
         unused_dependencies,
         unused_exports,
@@ -1155,6 +1187,7 @@ fn is_ignored_dir(path: &Path) -> bool {
     let ignored = [
         "node_modules",
         ".git",
+        ".haadi_trash",
         "dist",
         "build",
         "coverage",
@@ -1167,6 +1200,46 @@ fn is_ignored_dir(path: &Path) -> bool {
         .and_then(|n| n.to_str())
         .map(|name| ignored.contains(&name))
         .unwrap_or(false)
+}
+
+fn filter_assets_by_roots(
+    root: &Path,
+    assets: &HashSet<PathBuf>,
+    asset_roots: &[String],
+) -> HashSet<PathBuf> {
+    if asset_roots.is_empty() {
+        return assets.clone();
+    }
+
+    let roots: Vec<String> = asset_roots
+        .iter()
+        .map(|v| normalize_asset_root(v))
+        .filter(|v| !v.is_empty())
+        .collect();
+
+    if roots.is_empty() {
+        return assets.clone();
+    }
+
+    assets
+        .iter()
+        .filter(|asset| {
+            let rel = relative_display(root, asset).replace('\\', "/");
+            roots
+                .iter()
+                .any(|prefix| rel == *prefix || rel.starts_with(&format!("{prefix}/")))
+        })
+        .cloned()
+        .collect()
+}
+
+fn normalize_asset_root(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_string()
 }
 
 fn is_relative_specifier(specifier: &str) -> bool {
