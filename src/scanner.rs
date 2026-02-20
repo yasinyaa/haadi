@@ -40,11 +40,26 @@ pub(crate) fn collect_used_assets(
     assets: &HashSet<PathBuf>,
 ) -> Result<HashSet<PathBuf>> {
     let mut used = HashSet::new();
-    let string_literals = collect_string_literals(source_files)?;
-    let resolved_asset_usages = resolve_assets_from_source_imports(root, source_files, assets)?;
-    let globbed_asset_usages = resolve_assets_from_import_meta_globs(root, source_files, assets)?;
-    used.extend(resolved_asset_usages);
-    used.extend(globbed_asset_usages);
+    let mut string_literals = HashSet::new();
+    let indexed_assets: Vec<(PathBuf, String)> = assets
+        .iter()
+        .map(|asset| (asset.clone(), relative_display(root, asset).replace('\\', "/")))
+        .collect();
+
+    // Single-pass source scan: collect string literals, direct asset imports, and import.meta.glob usage.
+    for source_file in source_files {
+        let source = fs::read_to_string(source_file).unwrap_or_default();
+
+        collect_literals_and_direct_asset_usages(
+            root,
+            source_file,
+            assets,
+            &source,
+            &mut string_literals,
+            &mut used,
+        )?;
+        collect_asset_glob_usages(root, source_file, &source, &indexed_assets, &mut used)?;
+    }
 
     for asset in assets {
         if is_public_asset(asset) {
@@ -65,52 +80,45 @@ pub(crate) fn collect_used_assets(
     Ok(used)
 }
 
-fn resolve_assets_from_import_meta_globs(
+fn collect_asset_glob_usages(
     root: &Path,
-    source_files: &HashSet<PathBuf>,
-    assets: &HashSet<PathBuf>,
-) -> Result<HashSet<PathBuf>> {
-    let mut used = HashSet::new();
-    let indexed_assets: Vec<(PathBuf, String)> = assets
-        .iter()
-        .map(|asset| (asset.clone(), relative_display(root, asset).replace('\\', "/")))
-        .collect();
+    source_file: &Path,
+    source: &str,
+    indexed_assets: &[(PathBuf, String)],
+    out_used: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    for caps in IMPORT_META_GLOB_RE.captures_iter(source) {
+        let raw = [1usize, 2, 3]
+            .into_iter()
+            .find_map(|idx| caps.get(idx).map(|m| m.as_str()))
+            .unwrap_or_default();
+        if raw.is_empty() {
+            continue;
+        }
 
-    for source_file in source_files {
-        let source = fs::read_to_string(source_file).unwrap_or_default();
-        for caps in IMPORT_META_GLOB_RE.captures_iter(&source) {
-            let raw = [1usize, 2, 3]
-                .into_iter()
-                .find_map(|idx| caps.get(idx).map(|m| m.as_str()))
-                .unwrap_or_default();
-            if raw.is_empty() {
-                continue;
-            }
+        let spec = normalize_specifier(raw);
+        if spec.is_empty() {
+            continue;
+        }
 
-            let spec = normalize_specifier(raw);
-            if spec.is_empty() {
-                continue;
-            }
+        let Some(rel_pattern) = resolve_glob_specifier_to_rel_pattern(root, source_file, &spec)
+        else {
+            continue;
+        };
 
-            let Some(rel_pattern) = resolve_glob_specifier_to_rel_pattern(root, source_file, &spec)
-            else {
-                continue;
-            };
+        let Some(glob_re) = regex::Regex::new(&glob_path_pattern_to_regex(&rel_pattern)).ok()
+        else {
+            continue;
+        };
 
-            let Some(glob_re) = regex::Regex::new(&glob_path_pattern_to_regex(&rel_pattern)).ok()
-            else {
-                continue;
-            };
-
-            for (asset_abs, asset_rel) in &indexed_assets {
-                if glob_re.is_match(asset_rel) {
-                    used.insert(asset_abs.clone());
-                }
+        for (asset_abs, asset_rel) in indexed_assets {
+            if glob_re.is_match(asset_rel) {
+                out_used.insert(asset_abs.clone());
             }
         }
     }
 
-    Ok(used)
+    Ok(())
 }
 
 fn resolve_glob_specifier_to_rel_pattern(
@@ -191,37 +199,38 @@ fn glob_path_pattern_to_regex(glob: &str) -> String {
     out
 }
 
-fn resolve_assets_from_source_imports(
+fn collect_literals_and_direct_asset_usages(
     root: &Path,
-    source_files: &HashSet<PathBuf>,
+    source_file: &Path,
     assets: &HashSet<PathBuf>,
-) -> Result<HashSet<PathBuf>> {
-    let mut used = HashSet::new();
+    source: &str,
+    out_literals: &mut HashSet<String>,
+    out_used: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    for caps in STRING_LITERAL_RE.captures_iter(source) {
+        for idx in [1usize, 2, 3] {
+            let Some(m) = caps.get(idx) else {
+                continue;
+            };
+            let raw = m.as_str();
+            if raw.is_empty() {
+                continue;
+            }
 
-    for source_file in source_files {
-        let source = fs::read_to_string(source_file).unwrap_or_default();
-        for caps in STRING_LITERAL_RE.captures_iter(&source) {
-            for idx in [1usize, 2, 3] {
-                let Some(m) = caps.get(idx) else {
-                    continue;
-                };
-                let raw = m.as_str();
-                if raw.is_empty() {
-                    continue;
-                }
-                let spec = normalize_specifier(raw);
-                if spec.is_empty() {
-                    continue;
-                }
+            out_literals.insert(raw.to_string());
+            let spec = normalize_specifier(raw);
+            if spec.is_empty() {
+                continue;
+            }
+            out_literals.insert(spec.clone());
 
-                if let Some(resolved) = resolve_asset_specifier(root, source_file, &spec, assets)? {
-                    used.insert(resolved);
-                }
+            if let Some(resolved) = resolve_asset_specifier(root, source_file, &spec, assets)? {
+                out_used.insert(resolved);
             }
         }
     }
 
-    Ok(used)
+    Ok(())
 }
 
 fn resolve_asset_specifier(
@@ -275,57 +284,32 @@ fn resolve_asset_candidate(
     }
 
     for candidate in candidates {
-        if candidate.exists() {
-            let canonical = fs::canonicalize(&candidate)?;
-            if assets.contains(&canonical) {
-                return Ok(Some(canonical));
-            }
+        let normalized = normalize_path(candidate);
+        if assets.contains(&normalized) {
+            return Ok(Some(normalized));
         }
     }
 
     Ok(None)
 }
 
-fn collect_string_literals(files: &HashSet<PathBuf>) -> Result<HashSet<String>> {
-    let mut out = HashSet::new();
+fn normalize_path(path: PathBuf) -> PathBuf {
+    use std::path::Component;
 
-    for file in files {
-        let source = fs::read_to_string(file).unwrap_or_default();
-        for caps in STRING_LITERAL_RE.captures_iter(&source) {
-            if let Some(single) = caps.get(1) {
-                let s = single.as_str();
-                if !s.is_empty() {
-                    out.insert(s.to_string());
-                    let normalized = normalize_specifier(s);
-                    if !normalized.is_empty() {
-                        out.insert(normalized);
-                    }
-                }
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
             }
-            if let Some(double) = caps.get(2) {
-                let s = double.as_str();
-                if !s.is_empty() {
-                    out.insert(s.to_string());
-                    let normalized = normalize_specifier(s);
-                    if !normalized.is_empty() {
-                        out.insert(normalized);
-                    }
-                }
-            }
-            if let Some(template) = caps.get(3) {
-                let s = template.as_str();
-                if !s.is_empty() {
-                    out.insert(s.to_string());
-                    let normalized = normalize_specifier(s);
-                    if !normalized.is_empty() {
-                        out.insert(normalized);
-                    }
-                }
-            }
+            Component::RootDir => out.push(Path::new("/")),
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::Normal(v) => out.push(v),
         }
     }
 
-    Ok(out)
+    out
 }
 
 fn asset_reference_candidates(root: &Path, asset: &Path) -> Vec<String> {
