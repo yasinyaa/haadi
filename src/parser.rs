@@ -168,6 +168,7 @@ pub(crate) fn strip_comments(source: &str) -> String {
 
 fn parse_import_clause(clause: &str, record: &mut ImportRecord) {
     let cleaned = clause.trim();
+    let cleaned = cleaned.strip_prefix("type ").unwrap_or(cleaned).trim();
 
     if cleaned.contains("* as") {
         record.uses_namespace = true;

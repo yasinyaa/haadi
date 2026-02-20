@@ -46,7 +46,7 @@ const NEXT_APP_ROUTE_FILES: &[&str] = &[
 ];
 
 static IMPORT_FROM_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?m)^\s*import\s+([^;\n]+?)\s+from\s+['\"]([^'\"]+)['\"]"#).unwrap()
+    Regex::new(r#"(?ms)^\s*import\s+(.+?)\s+from\s+['\"]([^'\"]+)['\"]"#).unwrap()
 });
 static IMPORT_SIDE_EFFECT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?m)^\s*import\s+['\"]([^'\"]+)['\"]"#).unwrap());
@@ -55,12 +55,20 @@ static EXPORT_DECL_RE: Lazy<Regex> = Lazy::new(|| {
         .unwrap()
 });
 static EXPORT_LIST_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?m)^\s*export\s*\{\s*([^}]+)\s*\}(?:\s*from\s*['\"]([^'\"]+)['\"])?"#).unwrap()
+    Regex::new(
+        r#"(?ms)^\s*export\s+(?:type\s+)?\{\s*([^}]+)\s*\}(?:\s*from\s*['\"]([^'\"]+)['\"])?"#,
+    )
+    .unwrap()
 });
 static EXPORT_DEFAULT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?m)^\s*export\s+default\b"#).unwrap());
 static EXPORT_ALL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?m)^\s*export\s+\*\s+from\s+['\"]([^'\"]+)['\"]"#).unwrap());
+    Lazy::new(|| {
+        Regex::new(
+            r#"(?ms)^\s*export\s+(?:type\s+)?\*\s*(?:as\s+[A-Za-z_$][\w$]*\s*)?from\s+['\"]([^'\"]+)['\"]"#,
+        )
+        .unwrap()
+    });
 static REQUIRE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?m)(?:^|\s|=)require\(\s*['\"]([^'\"]+)['\"]\s*\)"#).unwrap());
 static DESTRUCTURE_REQUIRE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -74,6 +82,12 @@ static IDENT_TOKEN_RE: Lazy<Regex> =
 static STRING_LITERAL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r#"(?s)(?:'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)"|`([^`\\]*(?:\\.[^`\\]*)*)`)"#,
+    )
+    .unwrap()
+});
+static IMPORT_META_GLOB_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"import\.meta\.(?:glob|globEager)\s*\(\s*(?:'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)"|`([^`\\]*(?:\\.[^`\\]*)*)`)"#,
     )
     .unwrap()
 });

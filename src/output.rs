@@ -6,6 +6,7 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use regex::RegexBuilder;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,6 +23,13 @@ enum TuiPage {
 struct DeleteCandidate {
     rel_path: String,
     kind: &'static str,
+    state: CandidateState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateState {
+    Active,
+    Deleted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +235,7 @@ pub(crate) fn print_tui_report(report: &Report) -> Result<()> {
             undo_stack: Vec::new(),
         },
     };
+    let _ = hydrate_deleted_candidates_from_trash(&mut state.delete);
 
     let result = run_tui_loop(&mut terminal, report, &mut state);
 
@@ -444,10 +453,22 @@ fn handle_delete_key(code: KeyCode, state: &mut TuiState) -> Result<bool> {
             undo_last_deletion(&mut state.delete)?;
             Ok(false)
         }
+        KeyCode::Char('i') => {
+            restore_specific_file_from_trash(&mut state.delete)?;
+            Ok(false)
+        }
+        KeyCode::Char('o') => {
+            restore_folder_from_trash(&mut state.delete)?;
+            Ok(false)
+        }
         KeyCode::Char('f') => {
             state.delete.filter = state.delete.filter.next();
             clamp_delete_cursor(&mut state.delete);
             state.delete.message = format!("Filter: {}", state.delete.filter.label());
+            Ok(false)
+        }
+        KeyCode::Char('g') => {
+            reset_filter_and_search(&mut state.delete);
             Ok(false)
         }
         KeyCode::Char('/') => {
@@ -458,6 +479,15 @@ fn handle_delete_key(code: KeyCode, state: &mut TuiState) -> Result<bool> {
         }
         _ => Ok(false),
     }
+}
+
+fn reset_filter_and_search(state: &mut DeleteState) {
+    state.filter = DeleteFilter::All;
+    state.search_query.clear();
+    state.search_input.clear();
+    state.editing_search = false;
+    clamp_delete_cursor(state);
+    state.message = "Reset filter and search.".to_string();
 }
 
 fn toggle_selected(state: &mut DeleteState) {
@@ -492,6 +522,10 @@ fn apply_selected_deletions(state: &mut DeleteState) -> Result<()> {
         let Some(item) = state.items.get(idx) else {
             continue;
         };
+        if item.state == CandidateState::Deleted {
+            failed += 1;
+            continue;
+        }
 
         let joined = root.join(&item.rel_path);
         let absolute = fs::canonicalize(&joined).unwrap_or(joined.clone());
@@ -515,9 +549,9 @@ fn apply_selected_deletions(state: &mut DeleteState) -> Result<()> {
 
     deleted_indices.sort_unstable();
     deleted_indices.dedup();
-    for idx in deleted_indices.iter().rev().copied() {
-        if idx < state.items.len() {
-            state.items.remove(idx);
+    for idx in deleted_indices.iter().copied() {
+        if let Some(item) = state.items.get_mut(idx) {
+            item.state = CandidateState::Deleted;
         }
     }
 
@@ -567,7 +601,12 @@ fn undo_last_deletion(state: &mut DeleteState) -> Result<()> {
     }
 
     for candidate in restored_candidates {
-        state.items.push(candidate);
+        upsert_candidate_state(
+            &mut state.items,
+            &candidate.rel_path,
+            candidate.kind,
+            CandidateState::Active,
+        );
     }
     state
         .items
@@ -744,12 +783,257 @@ fn restore_all_sessions(state: &mut DeleteState) -> Result<()> {
         total_failed += failed;
     }
 
-    state.message = format!(
-        "Restored {} files from {} session(s). Failed: {}.",
-        total_restored, restored_session_count, total_failed
-    );
+    state.message = if total_failed > 0 {
+        format!(
+            "Restored {} files from {} session(s). Failed: {} (kept in trash).",
+            total_restored, restored_session_count, total_failed
+        )
+    } else {
+        format!(
+            "Restored {} files from {} session(s). Failed: {}.",
+            total_restored, restored_session_count, total_failed
+        )
+    };
 
     Ok(())
+}
+
+fn restore_specific_file_from_trash(state: &mut DeleteState) -> Result<()> {
+    let selected_deleted: HashSet<String> = state
+        .selected
+        .iter()
+        .filter_map(|idx| state.items.get(*idx))
+        .filter(|item| item.state == CandidateState::Deleted)
+        .map(|item| item.rel_path.clone())
+        .collect();
+    if !selected_deleted.is_empty() {
+        return restore_from_trash_matching(
+            state,
+            "restore_file",
+            "file",
+            "selected rows",
+            |rel| selected_deleted.contains(rel),
+        );
+    }
+
+    let query = normalized_rel_query(&state.search_query);
+    if query.is_empty() {
+        state.message =
+            "Select deleted rows (or set search to exact file path), then press i.".to_string();
+        return Ok(());
+    }
+
+    restore_from_trash_matching(state, "restore_file", "file", &query, |rel| rel == query)
+}
+
+fn restore_folder_from_trash(state: &mut DeleteState) -> Result<()> {
+    let query = normalized_rel_query(&state.search_query);
+    if query.is_empty() {
+        state.message =
+            "Set search to a folder path, then press o to restore that folder from trash."
+                .to_string();
+        return Ok(());
+    }
+
+    let prefix = format!("{query}/");
+    restore_from_trash_matching(state, "restore_folder", "folder", &query, |rel| {
+        rel == query || rel.starts_with(&prefix)
+    })
+}
+
+fn restore_from_trash_matching<F>(
+    state: &mut DeleteState,
+    log_action: &'static str,
+    scope: &'static str,
+    query: &str,
+    mut matcher: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> bool,
+{
+    let root = fs::canonicalize(&state.root).unwrap_or_else(|_| state.root.clone());
+    let trashed = latest_trashed_entries(&state.trash_root)?;
+    if trashed.is_empty() {
+        state.message = "Trash is empty.".to_string();
+        return Ok(());
+    }
+
+    let mut matches: Vec<(String, PathBuf)> = trashed
+        .into_iter()
+        .filter(|(rel, _)| matcher(rel.as_str()))
+        .collect();
+
+    if matches.is_empty() {
+        state.message = format!("No trashed {scope} matched '{query}'.");
+        return Ok(());
+    }
+
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut restored = 0usize;
+    let mut failed = 0usize;
+    let mut restored_entries = Vec::new();
+
+    for (rel_path, trash_abs) in matches {
+        let target = root.join(&rel_path);
+        if !target.starts_with(&root) {
+            failed += 1;
+            continue;
+        }
+        if target.exists() {
+            failed += 1;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        match fs::rename(&trash_abs, &target) {
+            Ok(_) => {
+                restored += 1;
+                let kind = if has_asset_extension(&target) {
+                    "asset"
+                } else {
+                    "file"
+                };
+                let candidate = DeleteCandidate {
+                    rel_path: rel_path.clone(),
+                    kind,
+                    state: CandidateState::Active,
+                };
+                upsert_candidate_state(
+                    &mut state.items,
+                    &candidate.rel_path,
+                    candidate.kind,
+                    CandidateState::Active,
+                );
+                restored_entries.push(DeletedEntry {
+                    candidate,
+                    original_abs: target,
+                    trash_abs,
+                });
+            }
+            Err(_) => failed += 1,
+        }
+    }
+
+    let _ = prune_empty_trash_sessions(&state.trash_root);
+    state
+        .items
+        .sort_by(|a, b| a.rel_path.cmp(&b.rel_path).then_with(|| a.kind.cmp(b.kind)));
+    state.selected.clear();
+    clamp_delete_cursor(state);
+
+    if !restored_entries.is_empty() {
+        let batch_id = generate_batch_id();
+        let _ = write_delete_log(&state.trash_root, log_action, &batch_id, &restored_entries);
+    }
+    state.message = format!("Restored {restored} {scope} match(es). Failed: {failed}.");
+
+    Ok(())
+}
+
+fn latest_trashed_entries(trash_root: &Path) -> Result<BTreeMap<String, PathBuf>> {
+    let sessions_root = trash_root.join("sessions");
+    if !sessions_root.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut rows: Vec<(String, String, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(&sessions_root)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let session_path = entry.path();
+        if !session_path.is_dir() {
+            continue;
+        }
+        let Some(session_id) = session_path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .map(|v| v.to_string())
+        else {
+            continue;
+        };
+
+        for walked in WalkDir::new(&session_path).into_iter().filter_map(|e| e.ok()) {
+            let file = walked.path();
+            if !file.is_file() {
+                continue;
+            }
+            let Ok(rel) = file.strip_prefix(&session_path) else {
+                continue;
+            };
+            rows.push((
+                session_id.clone(),
+                rel.to_string_lossy().replace('\\', "/"),
+                file.to_path_buf(),
+            ));
+        }
+    }
+
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut latest = BTreeMap::new();
+    for (_session_id, rel, path) in rows {
+        latest.entry(rel).or_insert(path);
+    }
+    Ok(latest)
+}
+
+fn upsert_candidate_state(
+    items: &mut Vec<DeleteCandidate>,
+    rel_path: &str,
+    kind: &'static str,
+    state: CandidateState,
+) {
+    if let Some(item) = items
+        .iter_mut()
+        .find(|item| item.rel_path == rel_path && item.kind == kind)
+    {
+        item.state = state;
+    } else {
+        items.push(DeleteCandidate {
+            rel_path: rel_path.to_string(),
+            kind,
+            state,
+        });
+    }
+}
+
+fn normalized_rel_query(input: &str) -> String {
+    input
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_string()
+}
+
+fn prune_empty_trash_sessions(trash_root: &Path) -> Result<usize> {
+    let sessions_root = trash_root.join("sessions");
+    if !sessions_root.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0usize;
+    for entry in fs::read_dir(&sessions_root)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let session_path = entry.path();
+        if !session_path.is_dir() {
+            continue;
+        }
+        let has_files = WalkDir::new(&session_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().is_file());
+        if !has_files {
+            let _ = fs::remove_dir_all(&session_path);
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn restore_session_path(
@@ -759,10 +1043,17 @@ fn restore_session_path(
 ) -> Result<()> {
     let (restored, failed) =
         restore_session_path_counts(state, session_path, "restore_previous_session")?;
-    state.message = format!(
-        "Restored {} files from session {}. Failed: {}.",
-        restored, session_id, failed
-    );
+    state.message = if failed > 0 {
+        format!(
+            "Restored {} files from session {}. Failed: {} (kept in trash).",
+            restored, session_id, failed
+        )
+    } else {
+        format!(
+            "Restored {} files from session {}. Failed: {}.",
+            restored, session_id, failed
+        )
+    };
     Ok(())
 }
 
@@ -815,8 +1106,14 @@ fn restore_session_path_counts(
                 let candidate = DeleteCandidate {
                     rel_path: rel_display,
                     kind,
+                    state: CandidateState::Active,
                 };
-                state.items.push(candidate.clone());
+                upsert_candidate_state(
+                    &mut state.items,
+                    &candidate.rel_path,
+                    candidate.kind,
+                    CandidateState::Active,
+                );
                 restored_entries.push(DeletedEntry {
                     candidate,
                     original_abs: target.clone(),
@@ -833,7 +1130,8 @@ fn restore_session_path_counts(
     state.selected.clear();
     clamp_delete_cursor(state);
 
-    let _ = fs::remove_dir_all(&session_path);
+    // Do not delete the whole session blindly: failed files must remain recoverable.
+    let _ = prune_empty_trash_sessions(&state.trash_root);
     let batch_id = generate_batch_id();
     if !restored_entries.is_empty() {
         let _ = write_delete_log(&state.trash_root, log_action, &batch_id, &restored_entries);
@@ -851,6 +1149,39 @@ fn now_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+fn hydrate_deleted_candidates_from_trash(state: &mut DeleteState) -> Result<()> {
+    let root = fs::canonicalize(&state.root).unwrap_or_else(|_| state.root.clone());
+
+    for (rel_path, trash_abs) in latest_trashed_entries(&state.trash_root)? {
+        let active_abs = root.join(&rel_path);
+        let state_kind = if has_asset_extension(Path::new(&rel_path))
+            || has_asset_extension(&trash_abs)
+            || has_asset_extension(&active_abs)
+        {
+            "asset"
+        } else {
+            "file"
+        };
+
+        upsert_candidate_state(
+            &mut state.items,
+            &rel_path,
+            state_kind,
+            if active_abs.exists() {
+                CandidateState::Active
+            } else {
+                CandidateState::Deleted
+            },
+        );
+    }
+
+    state
+        .items
+        .sort_by(|a, b| a.rel_path.cmp(&b.rel_path).then_with(|| a.kind.cmp(b.kind)));
+    clamp_delete_cursor(state);
+    Ok(())
 }
 
 fn draw_page(frame: &mut Frame, report: &Report, state: &TuiState) {
@@ -880,28 +1211,49 @@ fn draw_summary_page(frame: &mut Frame, report: &Report) {
 
     let summary = Paragraph::new(vec![
         Line::from(format!(
-            "sources {} | assets {} | reachable {} | entries {}",
-            report.summary.total_source_files,
-            report.summary.total_asset_files,
-            report.summary.total_reachable_files,
-            report.summary.total_entries
+            "total source files: {}",
+            report.summary.total_source_files
         )),
         Line::from(format!(
-            "unused files {} | used assets {} | unused assets {}",
-            report.summary.unused_files_count,
-            report.summary.used_assets_count,
-            report.summary.unused_assets_count,
+            "total asset files: {}",
+            report.summary.total_asset_files
         )),
         Line::from(format!(
-            "coverage {:.1}% | unused deps {} | unused exports {}",
-            report.summary.asset_usage_coverage_pct,
-            report.summary.unused_dependencies_count,
+            "reachable source files: {}",
+            report.summary.total_reachable_files
+        )),
+        Line::from(format!("entry files: {}", report.summary.total_entries)),
+        Line::from(format!(
+            "unused files: {}",
+            report.summary.unused_files_count
+        )),
+        Line::from(format!("used assets: {}", report.summary.used_assets_count)),
+        Line::from(format!(
+            "unused assets: {}",
+            report.summary.unused_assets_count
+        )),
+        Line::from(format!(
+            "asset coverage: {:.1}%",
+            report.summary.asset_usage_coverage_pct
+        )),
+        Line::from(format!(
+            "unused dependencies: {}",
+            report.summary.unused_dependencies_count
+        )),
+        Line::from(format!(
+            "unused exports: {}",
             report.summary.unused_exports_count
         )),
         Line::from(format!(
-            "unresolved locals {} | high-confidence {} | omitted risky {}",
-            report.summary.unresolved_local_imports,
-            report.summary.high_confidence_graph,
+            "unresolved local imports: {}",
+            report.summary.unresolved_local_imports
+        )),
+        Line::from(format!(
+            "high-confidence graph: {}",
+            report.summary.high_confidence_graph
+        )),
+        Line::from(format!(
+            "omitted risky findings: {}",
             report.summary.omitted_risky_findings
         )),
     ])
@@ -1005,7 +1357,7 @@ fn draw_delete_page(frame: &mut Frame, _report: &Report, state: &TuiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(8),
             Constraint::Length(4),
         ])
@@ -1013,7 +1365,8 @@ fn draw_delete_page(frame: &mut Frame, _report: &Report, state: &TuiState) {
 
     let header = Paragraph::new(vec![
         Line::from("Delete page: select unused files/assets only"),
-        Line::from("Controls: j/k move | space toggle | a all | c clear | f filter | / search | x delete | u undo | r restore prev | R restore all | z empty trash | y approve | b back | q quit"),
+        Line::from("Controls: j/k move | space toggle | a all | c clear | f filter | / search | g reset search+filter | x delete | u undo | i restore file (search) | o restore folder (search) | r restore prev | R restore all | z empty trash | y approve | b back | q quit"),
+        Line::from("Deleted files are shown in red and remain searchable for restore."),
     ])
     .block(Block::default().borders(Borders::ALL).title("Delete mode"))
     .wrap(Wrap { trim: true });
@@ -1042,10 +1395,20 @@ fn draw_delete_page(frame: &mut Frame, _report: &Report, state: &TuiState) {
             } else {
                 "[ ]"
             };
-            rows.push(ListItem::new(format!(
+            let text = format!(
                 "{marker} {selected} ({}) {}",
-                item.kind, item.rel_path
-            )));
+                if item.state == CandidateState::Deleted {
+                    "deleted"
+                } else {
+                    item.kind
+                },
+                item.rel_path
+            );
+            let mut row = ListItem::new(text);
+            if item.state == CandidateState::Deleted {
+                row = row.style(Style::default().fg(Color::Red));
+            }
+            rows.push(row);
         }
     }
 
@@ -1117,6 +1480,7 @@ fn build_delete_candidates(report: &Report) -> Vec<DeleteCandidate> {
         items.push(DeleteCandidate {
             rel_path: path.clone(),
             kind: "file",
+            state: CandidateState::Active,
         });
     }
 
@@ -1124,6 +1488,7 @@ fn build_delete_candidates(report: &Report) -> Vec<DeleteCandidate> {
         items.push(DeleteCandidate {
             rel_path: path.clone(),
             kind: "asset",
+            state: CandidateState::Active,
         });
     }
 
@@ -1132,12 +1497,18 @@ fn build_delete_candidates(report: &Report) -> Vec<DeleteCandidate> {
 }
 
 fn filtered_indices(state: &DeleteState) -> Vec<usize> {
-    let query = state.search_query.to_ascii_lowercase();
+    let query = state.search_query.trim();
+    let matcher = build_search_matcher(query);
     state
         .items
         .iter()
         .enumerate()
         .filter(|(_, item)| {
+            // Deleted rows stay hidden unless user is actively searching.
+            if item.state == CandidateState::Deleted && query.is_empty() {
+                return false;
+            }
+
             let kind_ok = match state.filter {
                 DeleteFilter::All => true,
                 DeleteFilter::Files => item.kind == "file",
@@ -1149,10 +1520,89 @@ fn filtered_indices(state: &DeleteState) -> Vec<usize> {
             if query.is_empty() {
                 return true;
             }
-            item.rel_path.to_ascii_lowercase().contains(&query)
+            matcher.matches(&item.rel_path)
         })
         .map(|(idx, _)| idx)
         .collect()
+}
+
+fn compile_case_insensitive_regex(pattern: &str) -> Option<regex::Regex> {
+    RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
+fn glob_like_to_regex(glob: &str) -> String {
+    let mut out = String::from("^");
+    for ch in glob.chars() {
+        match ch {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            _ => out.push_str(&regex::escape(&ch.to_string())),
+        }
+    }
+    out.push('$');
+    out
+}
+
+fn looks_like_regex(query: &str) -> bool {
+    query
+        .chars()
+        .any(|c| matches!(c, '[' | ']' | '(' | ')' | '|' | '+' | '^' | '$' | '{' | '}' | '\\' | '.'))
+}
+
+enum SearchMatcher {
+    Any,
+    Substring(String),
+    Regex(regex::Regex),
+}
+
+impl SearchMatcher {
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            SearchMatcher::Any => true,
+            SearchMatcher::Substring(q) => path.to_ascii_lowercase().contains(q),
+            SearchMatcher::Regex(re) => re.is_match(path),
+        }
+    }
+}
+
+fn build_search_matcher(query: &str) -> SearchMatcher {
+    let q = query.trim();
+    if q.is_empty() {
+        return SearchMatcher::Any;
+    }
+
+    if let Some(pattern) = q.strip_prefix("re:") {
+        if let Some(re) = compile_case_insensitive_regex(pattern) {
+            return SearchMatcher::Regex(re);
+        }
+        return SearchMatcher::Substring(q.to_ascii_lowercase());
+    }
+
+    if q.len() >= 2 && q.starts_with('/') && q.ends_with('/') {
+        let pattern = &q[1..q.len() - 1];
+        if let Some(re) = compile_case_insensitive_regex(pattern) {
+            return SearchMatcher::Regex(re);
+        }
+        return SearchMatcher::Substring(q.to_ascii_lowercase());
+    }
+
+    if q.contains('*') || q.contains('?') {
+        if let Some(re) = compile_case_insensitive_regex(&glob_like_to_regex(q)) {
+            return SearchMatcher::Regex(re);
+        }
+        return SearchMatcher::Substring(q.to_ascii_lowercase());
+    }
+
+    if looks_like_regex(q) {
+        if let Some(re) = compile_case_insensitive_regex(q) {
+            return SearchMatcher::Regex(re);
+        }
+    }
+
+    SearchMatcher::Substring(q.to_ascii_lowercase())
 }
 
 fn clamp_delete_cursor(state: &mut DeleteState) {
